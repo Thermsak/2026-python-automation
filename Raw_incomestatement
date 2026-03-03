@@ -1,0 +1,131 @@
+import fitz  # PyMuPDF
+import os
+import pandas as pd
+import re
+from datetime import datetime
+
+pdf_path = r"C:\\Users\\therm\\OneDrive\\Desktop\\AcctSt_Dec25.pdf"
+
+password = "16091991"
+
+# Open the PDF and unlock if necessary
+doc = fitz.open(pdf_path)
+if doc.needs_pass:
+    if not doc.authenticate(password):
+        raise ValueError("Incorrect PDF password")
+
+# Read and store all lines in order
+raw_lines = []
+for page_number, page in enumerate(doc):
+    blocks = page.get_text("blocks")
+    for block in sorted(blocks, key=lambda b: b[1]):
+        text = block[4].strip()
+        if text:
+            for subline in text.split('\n'):
+                raw_lines.append(subline.strip())
+
+# Group lines by detecting X1 or X2
+transactions = []
+i = 0
+while i < len(raw_lines):
+    line = raw_lines[i]
+    if "X1/" in line or "X2/" in line:
+        trans_type = "X1" if "X1/" in line else "X2"
+
+        # Look back for date and time
+        date_line = raw_lines[i-2] if i >= 2 else ''
+        time_line = raw_lines[i-1] if i >= 1 else ''
+
+        # Start grouping from date line to below
+        group = [date_line, time_line, line]
+        i += 1
+        while i < len(raw_lines):
+            group.append(raw_lines[i])
+            if 'NOTE :' in raw_lines[i]:
+                break
+            i += 1
+        transactions.append(group)
+    else:
+        i += 1
+
+# Parse each group
+parsed = []
+for group in transactions:
+    text = "\n".join(group)
+    timestamp_match = re.search(r"(\d{2}/\d{2}/\d{2}).*?(\d{2}:\d{2})", text, re.DOTALL)
+    trans_type = "X1" if any("X1/" in l for l in group) else ("X2" if any("X2/" in l for l in group) else None)
+    amount = None
+    for l in group:
+        if re.match(r"\d{1,3}(?:,\d{3})*\.\d{2}$", l):
+            amount = float(l.replace(",", ""))
+            break
+
+    # Extract note: lines between amount and DESC
+    note_lines = []
+    found_amount = False
+    for l in group:
+        if found_amount:
+            if 'DESC :' in l or 'NOTE :' in l:
+                break
+            note_lines.append(l)
+        if re.match(r"\d{1,3}(?:,\d{3})*\.\d{2}$", l):
+            found_amount = True
+
+    note = " ".join(note_lines).strip()
+
+    if trans_type and amount and timestamp_match:
+        timestamp_raw = f"{timestamp_match.group(1)} {timestamp_match.group(2)}"
+        try:
+            timestamp_obj = datetime.strptime(timestamp_raw, "%d/%m/%y %H:%M")
+            timestamp = timestamp_obj.strftime("%Y-%m-%d %H:%M")
+            month_year = timestamp_obj.strftime("%b-%Y")
+        except ValueError:
+            timestamp = timestamp_raw
+            month_year = ''
+
+        # First level categorization
+        if re.search(r'\b\d{5}__?[A-Za-z0-9]+', note):
+            category = 'KOL Expense'
+        elif 'creditcard' in note.lower():
+            category = 'Credit Card'
+        elif 'payroll' in note.lower():
+            category = 'Payroll'
+        elif 'revenue department' in note.lower():
+            category = 'Tax'
+        else:
+            category = 'Other'
+
+        # Financial classification
+        if category in ['Credit Card', 'KOL Expense']:
+            classification = 'COGS'
+        elif category in ['Payroll', 'Other']:
+            classification = 'SG&A'
+        elif category == 'Tax':
+            classification = 'Tax'
+        else:
+            classification = ''
+
+        parsed.append({
+            "Type": "Income" if trans_type == "X1" else "Expense",
+            "Timestamp": timestamp,
+            "Month-Year": month_year,
+            "Amount": amount,
+            "Note": note,
+            "Category": category if trans_type == "X2" else '',
+            "Classification": classification if trans_type == "X2" else ''
+        })
+
+# Convert to DataFrame and export
+final_df = pd.DataFrame(parsed)
+
+# Split
+income_df = final_df[final_df['Type'] == 'Income'].drop(columns=['Type', 'Category', 'Classification'])
+expense_df = final_df[final_df['Type'] == 'Expense'].drop(columns=['Type'])
+
+# Export to a single Excel file with two sheets
+output_path = os.path.expanduser("~\\OneDrive\\Desktop")
+with pd.ExcelWriter(os.path.join(output_path, "CashFlow_Transactions.xlsx")) as writer:
+    income_df.to_excel(writer, sheet_name='Income', index=False)
+    expense_df.to_excel(writer, sheet_name='Expense', index=False)
+
+print("Export complete: CashFlow_Transactions.xlsx with Income and Expense tabs")

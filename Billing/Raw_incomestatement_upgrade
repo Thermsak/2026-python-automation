@@ -1,0 +1,299 @@
+import fitz  # PyMuPDF
+import os
+import pandas as pd
+import re
+from datetime import datetime
+
+pdf_path = r"C:\\Users\\therm\\OneDrive\\Desktop\\AcctSt_Jan26.pdf"
+password = "16091991"
+
+# ---------------------------
+# Helpers
+# ---------------------------
+def is_amount(s: str) -> bool:
+    return bool(re.fullmatch(r"\d{1,3}(?:,\d{3})*\.\d{2}|\d+\.\d{2}", (s or "").strip()))
+
+def to_float(s: str) -> float:
+    return float(s.replace(",", "").strip())
+
+def norm(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip())
+
+def y_close(a, b, tol=2.5):
+    return abs(a - b) <= tol
+
+def extract_amount_candidates(text: str):
+    nums = re.findall(r"\d{1,3}(?:,\d{3})*\.\d{2}|\d+\.\d{2}", text or "")
+    return [to_float(n) for n in nums] if nums else []
+
+def parse_statement_month_year(doc):
+    """
+    Extract statement period from first page text, e.g. 01/12/2025 - 31/12/2025
+    Return Month-Year like 'Dec-25'
+    """
+    t = doc[0].get_text("text")
+    m = re.search(r"(\d{2}/\d{2}/\d{2,4})\s*-\s*(\d{2}/\d{2}/\d{2,4})", t)
+    if not m:
+        return ""
+    start = m.group(1)
+    try:
+        if len(start.split("/")[-1]) == 2:
+            dt = datetime.strptime(start, "%d/%m/%y")
+        else:
+            dt = datetime.strptime(start, "%d/%m/%Y")
+        return dt.strftime("%b-%y")  # Dec-25
+    except Exception:
+        return ""
+
+# ---------------------------
+# Open PDF (unlock)
+# ---------------------------
+doc = fitz.open(pdf_path)
+if doc.needs_pass:
+    if not doc.authenticate(password):
+        raise ValueError("Incorrect PDF password")
+
+statement_month_year = parse_statement_month_year(doc) or "Dec-25"
+
+# ---------------------------
+# Extract words (x0, y0, x1, y1, text)
+# ---------------------------
+pages_words = []
+for page in doc:
+    words = page.get_text("words")  # (x0,y0,x1,y1,word,block,line,word_no)
+    pages_words.append(words)
+
+if not pages_words or not pages_words[0]:
+    raise ValueError("No text extracted from PDF (is it scanned image-only?)")
+
+# ---------------------------
+# Detect header positions (page 1)
+# ---------------------------
+header_targets = {
+    "Date": ["Date", "วันที่"],
+    "Time": ["Time", "เวลา"],
+    "Code": ["Code", "รายการ"],
+    "Channel": ["Channel", "ช่องทาง"],
+    "DebitCredit": ["Debit/Credit", "ฝาก/ถอน", "ฝาก/ถอนเงิน"],
+    "Balance": ["Balance/Baht", "ยอดคงเหลือ", "Balance"],
+    "DescNote": ["Description/Note", "รายละเอียด", "บันทึก"],
+}
+
+header_hits = []
+for (x0, y0, x1, y1, w, *_rest) in pages_words[0]:
+    ww = (w or "").strip()
+    for key, variants in header_targets.items():
+        if any(ww == v or v in ww for v in variants):
+            header_hits.append((key, x0, y0, ww))
+
+if not header_hits:
+    raise ValueError("Could not detect table headers. The PDF layout may differ.")
+
+header_y = sorted([h[2] for h in header_hits])[len(header_hits) // 2]
+
+col_x = {}
+for key, x0, y0, ww in header_hits:
+    if abs(y0 - header_y) <= 10:
+        col_x[key] = min(col_x.get(key, 10**9), x0)
+
+required = ["Date", "Time", "Code", "Channel", "DebitCredit", "Balance", "DescNote"]
+missing = [k for k in required if k not in col_x]
+if missing:
+    raise ValueError(f"Missing header columns: {missing}. Found: {col_x}")
+
+cols_sorted = sorted(col_x.items(), key=lambda kv: kv[1])
+col_names = [c[0] for c in cols_sorted]
+col_starts = [c[1] for c in cols_sorted]
+
+def assign_col(x0):
+    idx = 0
+    for i, sx in enumerate(col_starts):
+        if x0 >= sx:
+            idx = i
+        else:
+            break
+    return col_names[idx]
+
+# ---------------------------
+# Parse table rows by y grouping (all pages)
+# ---------------------------
+rows = []
+for words in pages_words:
+    table_words = [(x0, y0, x1, y1, w) for (x0, y0, x1, y1, w, *_r) in words if y0 > header_y + 5]
+    table_words.sort(key=lambda t: (t[1], t[0]))
+
+    grouped = []
+    for (x0, y0, x1, y1, w) in table_words:
+        if not grouped:
+            grouped.append({"y": y0, "items": [(x0, w)]})
+        else:
+            if y_close(y0, grouped[-1]["y"], tol=2.5):
+                grouped[-1]["items"].append((x0, w))
+            else:
+                grouped.append({"y": y0, "items": [(x0, w)]})
+
+    for g in grouped:
+        row = {k: "" for k in required}
+        for x0, w in sorted(g["items"], key=lambda t: t[0]):
+            col = assign_col(x0)
+            row[col] = (row[col] + " " + (w or "")).strip()
+
+        row = {k: norm(v) for k, v in row.items()}
+
+        # skip blank/noise rows
+        if not row["Date"] and not row["DescNote"] and not row["Balance"] and not row["DebitCredit"]:
+            continue
+        # skip repeated headers
+        if row["Date"] in ("Date", "วันที่") and row["Time"] in ("Time", "เวลา"):
+            continue
+
+        rows.append(row)
+
+if not rows:
+    raise ValueError("No table rows detected under header.")
+
+# ---------------------------
+# Merge wrapped DESC/NOTE lines into previous transaction row
+# A new transaction starts when Date is exactly dd/mm/yy
+# ---------------------------
+tx = []
+current = None
+date_re = re.compile(r"^\d{2}/\d{2}/\d{2}$")
+
+for r in rows:
+    date_val = r["Date"].split()[0] if r["Date"] else ""
+    if date_re.match(date_val):
+        if current:
+            tx.append(current)
+        current = r.copy()
+    else:
+        if current:
+            # append continuation content (desc/note is the main thing that wraps)
+            extra = " ".join([r.get("DescNote", ""), r.get("DebitCredit", ""), r.get("Balance", "")]).strip()
+            if extra:
+                current["DescNote"] = norm(current.get("DescNote", "") + " " + extra)
+
+if current:
+    tx.append(current)
+
+# ---------------------------
+# Filter only X1/X2 and skip BALANCE BROUGHT FORWARD rows
+# ---------------------------
+tx_clean = []
+for t in tx:
+    if t.get("Code") not in ("X1", "X2"):
+        continue
+    note_upper = (t.get("DescNote") or "").upper()
+    if "BALANCE BROUGHT FORWARD" in note_upper:
+        continue
+    tx_clean.append(t)
+tx = tx_clean
+
+if not tx:
+    raise ValueError("No X1/X2 transactions found after filtering.")
+
+# ---------------------------
+# Convert to output schema (safe amount selection)
+# ---------------------------
+parsed = []
+for t in tx:
+    # Timestamp
+    ts_raw = f"{t['Date'].split()[0]} {t['Time'].split()[0] if t['Time'] else ''}".strip()
+    timestamp = ts_raw
+    try:
+        dt = datetime.strptime(ts_raw, "%d/%m/%y %H:%M")
+        timestamp = dt.strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        pass
+
+    # Balance
+    balance = None
+    bal_candidates = extract_amount_candidates(t.get("Balance", ""))
+    if bal_candidates:
+        balance = bal_candidates[0]
+
+    # Amount (prefer DebitCredit column ONLY)
+    amount = None
+    dc_candidates = extract_amount_candidates(t.get("DebitCredit", ""))
+    if dc_candidates:
+        amount = dc_candidates[0]
+
+    # Controlled fallback (avoid choosing balance as amount)
+    if amount is None:
+        row_text = " ".join([str(v) for v in t.values() if v])
+        all_candidates = extract_amount_candidates(row_text)
+
+        cleaned = []
+        for x in all_candidates:
+            if balance is not None and abs(x - balance) < 0.01:
+                continue
+            cleaned.append(x)
+
+        # choose smallest reasonable amount (avoid multi-million balances)
+        reasonable = [x for x in cleaned if x < 1_000_000]
+        if reasonable:
+            amount = min(reasonable)
+
+    if amount is None:
+        # Better to skip than write wrong amount
+        continue
+
+    note = norm(t.get("DescNote", ""))
+
+    # Categorization (same logic as yours)
+    if re.search(r"\b\d{5}__?[A-Za-z0-9]+", note):
+        category = "KOL Expense"
+    elif "creditcard" in note.lower():
+        category = "Credit Card"
+    elif "payroll" in note.lower():
+        category = "Payroll"
+    elif "revenue department" in note.lower():
+        category = "Tax"
+    else:
+        category = "Other"
+
+    # Financial classification
+    if category in ["Credit Card", "KOL Expense"]:
+        classification = "COGS"
+    elif category in ["Payroll", "Other"]:
+        classification = "SG&A"
+    elif category == "Tax":
+        classification = "Tax"
+    else:
+        classification = ""
+
+    trans_type = "Income" if t["Code"] == "X1" else "Expense"
+
+    parsed.append({
+        "Type": trans_type,
+        "Timestamp": timestamp,
+        "Month-Year": statement_month_year,  # <-- fixed: Dec-25
+        "Amount": amount,
+        "Balance": balance,
+        "Note": note,
+        "Category": category if trans_type == "Expense" else "",
+        "Classification": classification if trans_type == "Expense" else "",
+    })
+
+# ---------------------------
+# Export
+# ---------------------------
+final_df = pd.DataFrame(
+    parsed,
+    columns=["Type", "Timestamp", "Month-Year", "Amount", "Balance", "Note", "Category", "Classification"]
+)
+
+if final_df.empty:
+    raise ValueError("Parsed dataframe is empty. PDF format may have changed further.")
+
+income_df = final_df[final_df["Type"] == "Income"].drop(columns=["Type", "Category", "Classification"])
+expense_df = final_df[final_df["Type"] == "Expense"].drop(columns=["Type"])
+
+output_path = os.path.expanduser(r"~\OneDrive\Desktop")
+out_file = os.path.join(output_path, "CashFlow_Transactions.xlsx")
+
+with pd.ExcelWriter(out_file) as writer:
+    income_df.to_excel(writer, sheet_name="Income", index=False)
+    expense_df.to_excel(writer, sheet_name="Expense", index=False)
+
+print(f"Export complete: {out_file} (Income & Expense tabs)")

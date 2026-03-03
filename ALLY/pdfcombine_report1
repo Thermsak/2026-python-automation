@@ -1,0 +1,54 @@
+import os, re
+from PyPDF2 import PdfMerger
+
+folder_path = r'C:\Users\therm\OneDrive\Desktop\2025-11 ALLY'
+output_folder = folder_path
+
+# Patterns
+inv_pattern     = re.compile(r'^(IV(\d{6}\d{3})) - (.+)\.pdf$', re.IGNORECASE)
+receipt_pattern = re.compile(r'^(RE-\d{4}) - (.+)\.pdf$', re.IGNORECASE)
+report_pattern  = re.compile(r'^ALLY_Dashboard_-_(.+)\.pdf$', re.IGNORECASE)
+
+# Build receipt and report lookup
+receipts = {}
+reports = {}
+
+for f in os.listdir(folder_path):
+    if report_pattern.match(f):
+        branch = report_pattern.match(f).group(1).strip()
+        reports[branch] = os.path.join(folder_path, f)
+    elif receipt_pattern.match(f):
+        _, branch = receipt_pattern.match(f).groups()
+        receipts[branch.strip()] = os.path.join(folder_path, f)
+
+# Merge invoices + receipts + reports
+for f in os.listdir(folder_path):
+    m = inv_pattern.match(f)
+    if not m:
+        continue
+
+    full_inv_name, _, branch = m.groups()
+    branch = branch.strip()
+    inv_path = os.path.join(folder_path, f)
+    receipt_path = receipts.get(branch)
+    report_path = reports.get(branch)
+
+    if not receipt_path:
+        print(f'⚠️ No receipt for branch "{branch}" — skipping {f}')
+        continue
+    if not report_path:
+        print(f'⚠️ No report for branch "{branch}" — skipping {f}')
+        continue
+
+    # Merge in order: invoice -> receipt -> report
+    merger = PdfMerger()
+    merger.append(inv_path)
+    merger.append(receipt_path)
+    merger.append(report_path)
+
+    out_name = f"{full_inv_name} - {branch} - Receipt+Report.pdf"
+    out_path = os.path.join(output_folder, out_name)
+    merger.write(out_path)
+    merger.close()
+
+    print(f'✅ Created: {out_name}')

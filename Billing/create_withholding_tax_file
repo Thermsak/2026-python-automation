@@ -1,0 +1,150 @@
+import openpyxl
+import os
+import shutil
+import time
+import psutil  # Ensure psutil is installed: pip install psutil
+import gc
+from win32com.client import Dispatch
+
+# File paths
+bill_list_path = r'C:\Users\therm\OneDrive\Desktop\WIthHoldingtax_receipt\billList.xlsx'
+withholdingtax_template_path = r'C:\Users\therm\OneDrive\Desktop\WIthHoldingtax_receipt\withholdingtaxTemplate.xlsx'
+receipt_template_path = r'C:\Users\therm\OneDrive\Desktop\WIthHoldingtax_receipt\RecTemplate.xlsx'
+output_folder = 'C:/Users/therm/OneDrive/Desktop/WIthHoldingtax_receipt/Finished_file/'
+
+def close_excel_process():
+    """Ensure all Excel processes are closed to avoid file lock issues."""
+    for process in psutil.process_iter(attrs=['pid', 'name']):
+        if "EXCEL.EXE" in process.info['name']:
+            try:
+                process.terminate()
+            except psutil.NoSuchProcess:
+                pass
+
+def fill_and_save_withholdingtax(row, template_path, output_folder):
+    doc_number = row[0].value
+    creator_name = row[1].value
+    name = row[2].value
+    address = row[3].value
+    id_number = row[4].value
+    date = row[5].value
+    cost = row[6].value
+    withholdingtax = row[7].value
+    company_or_personal = row[10].value
+
+    # Skip if withholding tax is 0
+    if withholdingtax == 0:
+        return
+
+    # Load the template
+    wb = openpyxl.load_workbook(template_path)
+    ws = wb["FORM"]
+
+    # Fill the form
+    ws["Q3"] = doc_number
+    ws["C12"] = name
+    ws["C14"] = address
+    ws["G59"] = date
+    ws["O45"] = cost
+
+    if company_or_personal is not None and company_or_personal.lower() == "company":
+        ws["M18"] = "X"
+        ws["P12"] = id_number
+    else:
+        ws["H18"] = "X"
+        ws["P11"] = id_number
+
+    # Save the filled template to a new Excel file
+    output_file_name = f"50ทวิ_{doc_number}_{creator_name}.xlsx"
+    output_file_path = os.path.join(output_folder, output_file_name)
+    wb.save(output_file_path)
+    wb.close()
+
+    # Print to PDF
+    pdf_file_name = output_file_name.replace(".xlsx", ".pdf")
+    pdf_file_path = os.path.join(output_folder, pdf_file_name)
+
+    try:
+        excel = Dispatch("Excel.Application")
+        excel.Visible = False
+        wb_excel = excel.Workbooks.Open(output_file_path)
+        wb_excel.ExportAsFixedFormat(0, pdf_file_path)
+        wb_excel.Close(False)
+        del wb_excel
+        excel.Quit()
+        del excel
+        gc.collect()
+        time.sleep(1.5)
+    finally:
+        close_excel_process()
+        try:
+            os.remove(output_file_path)
+        except PermissionError:
+            print(f"Could not delete {output_file_path}. Please close it manually.")
+
+def fill_and_save_receipt(row, template_path, output_folder):
+    doc_number = row[0].value
+    creator_name = row[1].value
+    name = row[2].value
+    address = row[3].value
+    id_number = row[4].value
+    date = row[5].value
+    cost = row[6].value
+    withholdingtax = row[7].value
+    company_or_personal = row[10].value
+
+    # Load the template
+    wb = openpyxl.load_workbook(template_path)
+    ws = wb["Rec"]
+
+    # Fill the form
+    ws["B8"] = doc_number
+    ws["B10"] = name
+    ws["B11"] = address
+    ws["B12"] = id_number
+    ws["B6"] = date
+    ws["B35"] = date
+    ws["D16"] = cost
+    ws["E30"] = withholdingtax
+
+    # Save the filled template to a new Excel file
+    output_file_name = f"rec_{doc_number}_{creator_name}.xlsx"
+    output_file_path = os.path.join(output_folder, output_file_name)
+    wb.save(output_file_path)
+    wb.close()
+
+    # Print to PDF
+    pdf_file_name = output_file_name.replace(".xlsx", ".pdf")
+    pdf_file_path = os.path.join(output_folder, pdf_file_name)
+
+    try:
+        excel = Dispatch("Excel.Application")
+        excel.Visible = False
+        wb_excel = excel.Workbooks.Open(output_file_path)
+        wb_excel.ExportAsFixedFormat(0, pdf_file_path)
+        wb_excel.Close(False)
+        del wb_excel
+        excel.Quit()
+        del excel
+        gc.collect()
+        time.sleep(1.5)
+    finally:
+        close_excel_process()
+        try:
+            os.remove(output_file_path)
+        except PermissionError:
+            print(f"Could not delete {output_file_path}. Please close it manually.")
+
+# Load the bill list
+bill_wb = openpyxl.load_workbook(bill_list_path)
+bill_ws = bill_wb["Billing"]
+
+# Process each row (skip the header)
+for row in bill_ws.iter_rows(min_row=2, values_only=False):
+    doc_number = row[0].value
+    if not doc_number:  # Stop if DocNumber is empty
+        break
+    fill_and_save_withholdingtax(row, withholdingtax_template_path, output_folder)
+    fill_and_save_receipt(row, receipt_template_path, output_folder)
+
+print("Process completed. All withholding tax and receipt documents saved as PDF.")

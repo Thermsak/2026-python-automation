@@ -1,0 +1,251 @@
+import os
+import re
+import fitz  # PyMuPDF
+
+# =========================
+# CONFIG
+# =========================
+folder_path = r"C:\Users\therm\OneDrive\Desktop\2026-01 ALLY"
+output_folder = os.path.join(folder_path, "Merged")
+
+BRANCHES = [
+    "TC Ekamai", "TCR", "TCP", "IMP", "PLN", "TS", "SRM", "SRP",
+    "APP", "AMR", "HPA", "SRS", "CDC"
+]
+
+# ถ้า PDF มีรหัสผ่านใส่ไว้ตรงนี้ (ถ้าไม่มีปล่อยเป็น None)
+PDF_PASSWORD = None
+
+
+# =========================
+# HELPERS
+# =========================
+def normalize_spaces(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "")).strip()
+
+def extract_text_first_pages(pdf_path, pages=2):
+    """Extract text from first N pages (usually enough for header + description)."""
+    doc = fitz.open(pdf_path)
+    if doc.needs_pass:
+        if not PDF_PASSWORD:
+            doc.close()
+            raise ValueError("PDF is password-protected but PDF_PASSWORD is None")
+        ok = doc.authenticate(PDF_PASSWORD)
+        if not ok:
+            doc.close()
+            raise ValueError("Incorrect PDF password")
+
+    text = []
+    max_pages = min(pages, doc.page_count)
+    for i in range(max_pages):
+        text.append(doc.load_page(i).get_text("text"))
+    doc.close()
+    return "\n".join(text)
+
+def detect_branch_from_text(text: str):
+    """
+    Find branch name by scanning for patterns in description like:
+    'CDC - 14,311.83' or 'TC Ekamai - ...'
+    """
+    t = normalize_spaces(text).lower()
+    branches_sorted = sorted(BRANCHES, key=len, reverse=True)  # "TC Ekamai" first
+
+    for b in branches_sorted:
+        b_low = b.lower()
+
+        # allow forms: "CDC -", "CDC-", "CDC :"
+        if re.search(rf"\b{re.escape(b_low)}\b\s*[-:]", t):
+            return b
+
+        # fallback: appears anywhere
+        if re.search(rf"\b{re.escape(b_low)}\b", t):
+            return b
+
+    return None
+
+def extract_invoice_no(text: str):
+    # IV202601003 (no dash)
+    m = re.search(r"\bIV\d{6,}\b", text)
+    return m.group(0) if m else None
+
+def extract_receipt_no(text: str):
+    # RET-202601003 (with dash) sometimes may appear RET202601003
+    m = re.search(r"\bRET-?\d{6,}\b", text)
+    if not m:
+        return None
+    s = m.group(0)
+    s = s.replace("RET", "RET-")
+    s = re.sub(r"RET--", "RET-", s)
+    return s
+
+def extract_invoice_ref_from_receipt(text: str):
+    """
+    Receipt usually has 'อ้างอิง : IVxxxx'
+    We'll find the first IV number found.
+    """
+    m = re.search(r"(อ้างอิง|reference)\s*[:\-]?\s*(IV\d{6,})", text, re.IGNORECASE)
+    if m:
+        return m.group(2)
+    return extract_invoice_no(text)
+
+# ---------- UPDATED: REPORT detection from filename ----------
+def is_report_filename(fn: str):
+    """
+    รองรับชื่อแบบ:
+      - ALLY Dashboard - AMR.pdf
+      - ALLY_Dashboard_-_AMR.pdf
+      - ally_dashboard-amr.pdf
+    """
+    name = os.path.splitext(fn)[0].lower()
+    name = name.replace("_", " ").replace("-", " ")
+    name = normalize_spaces(name)
+    return name.startswith("ally dashboard")
+
+def parse_branch_from_report_filename(fn: str):
+    """
+    ดึงสาขาจากท้ายชื่อไฟล์ report เช่น:
+      ALLY_Dashboard_-_AMR  -> AMR
+      ALLY Dashboard - TC Ekamai -> TC Ekamai
+    """
+    base = os.path.splitext(fn)[0]
+    norm = base.replace("_", " ").replace("-", " ")
+    norm = normalize_spaces(norm)
+
+    # prefer branch at end
+    for b in sorted(BRANCHES, key=len, reverse=True):
+        if re.search(rf"\b{re.escape(b)}\b$", norm, re.IGNORECASE):
+            return b
+
+    # fallback: appears anywhere
+    for b in sorted(BRANCHES, key=len, reverse=True):
+        if re.search(rf"\b{re.escape(b)}\b", norm, re.IGNORECASE):
+            return b
+
+    return None
+
+def merge_pdfs(pdf_paths, output_path):
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    out = fitz.open()
+
+    for p in pdf_paths:
+        if not p or not os.path.exists(p):
+            continue
+
+        src = fitz.open(p)
+        if src.needs_pass:
+            if not PDF_PASSWORD:
+                src.close()
+                raise ValueError(f"PDF is password-protected but PDF_PASSWORD is None: {p}")
+            ok = src.authenticate(PDF_PASSWORD)
+            if not ok:
+                src.close()
+                raise ValueError(f"Incorrect PDF password: {p}")
+
+        out.insert_pdf(src)
+        src.close()
+
+    if out.page_count == 0:
+        out.close()
+        raise ValueError(f"No pages to save for output: {output_path}")
+
+    out.save(output_path)
+    out.close()
+
+
+# =========================
+# MAIN
+# =========================
+def main():
+    os.makedirs(output_folder, exist_ok=True)
+
+    reports_by_branch = {}   # branch -> path
+    invoices_by_no = {}      # IVxxxx -> {path, branch}
+    receipts_by_no = {}      # RET-xxxx -> {path, branch, inv_ref}
+
+    pdf_files = [f for f in os.listdir(folder_path) if f.lower().endswith(".pdf")]
+    pdf_paths = [os.path.join(folder_path, f) for f in pdf_files]
+
+    # 1) Index all PDFs
+    for p in pdf_paths:
+        fn = os.path.basename(p)
+
+        # Reports from filename
+        if is_report_filename(fn):
+            b = parse_branch_from_report_filename(fn)
+            if b:
+                reports_by_branch[b] = p
+            else:
+                print(f"[WARN] Report found but cannot parse branch: {fn}")
+            continue
+
+        # For invoice/receipt: read first pages
+        try:
+            text = extract_text_first_pages(p, pages=2)
+        except Exception as e:
+            print(f"[SKIP] cannot read {fn}: {e}")
+            continue
+
+        receipt_no = extract_receipt_no(text)
+        inv_no = extract_invoice_no(text)
+        branch = detect_branch_from_text(text)
+
+        # Receipt
+        if receipt_no:
+            inv_ref = extract_invoice_ref_from_receipt(text)
+            receipts_by_no[receipt_no] = {
+                "path": p,
+                "branch": branch,
+                "inv_ref": inv_ref
+            }
+            continue
+
+        # Invoice
+        if inv_no:
+            invoices_by_no[inv_no] = {
+                "path": p,
+                "branch": branch
+            }
+            continue
+
+    # Debug: ensure reports were found
+    print("\n[INFO] Reports found:")
+    for b, rp in reports_by_branch.items():
+        print(f"  - {b}: {os.path.basename(rp)}")
+
+    # 2) Build merged file per receipt
+    created = 0
+    for ret_no, info in receipts_by_no.items():
+        branch = info["branch"]
+        inv_ref = info["inv_ref"]
+        receipt_path = info["path"]
+
+        invoice_path = None
+        if inv_ref and inv_ref in invoices_by_no:
+            invoice_path = invoices_by_no[inv_ref]["path"]
+            # if branch missing, inherit from matched invoice
+            if not branch:
+                branch = invoices_by_no[inv_ref]["branch"]
+
+        report_path = reports_by_branch.get(branch) if branch else None
+
+        # Output name
+        branch_tag = branch if branch else "UNKNOWN"
+        out_name = f"{ret_no} - {branch_tag}.pdf"
+        out_path = os.path.join(output_folder, out_name)
+
+        # Merge order: Report -> Invoice -> Receipt
+        merge_list = [invoice_path, receipt_path, report_path]
+        merge_pdfs(merge_list, out_path)
+
+        created += 1
+        print(f"[OK] {out_name}")
+        if not report_path:
+            print(f"      [WARN] No report matched for branch: {branch_tag}")
+        if not invoice_path:
+            print(f"      [WARN] No invoice matched for receipt: {ret_no} (inv_ref={inv_ref})")
+
+    print(f"\nDone. Created {created} merged files in:\n{output_folder}")
+
+
+if __name__ == "__main__":
+    main()
